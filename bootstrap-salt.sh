@@ -1801,7 +1801,7 @@ elif [ "${DISTRO_NAME_L}" = "debian" ]; then
   __debian_codename_translation
 fi
 
-if [ "$(echo "${DISTRO_NAME_L}" | grep -E '(debian|ubuntu|centos|red_hat|oracle|scientific|amazon|fedora|macosx)')" = "" ] && [ "$ITYPE" = "stable" ] && [ "$STABLE_REV" != "latest" ]; then
+if [ "$(echo "${DISTRO_NAME_L}" | grep -E '(debian|ubuntu|gentoo|centos|red_hat|oracle|scientific|amazon|fedora|macosx)')" = "" ] && [ "$ITYPE" = "stable" ] && [ "$STABLE_REV" != "latest" ]; then
     echoerror "${DISTRO_NAME} does not have major version pegged packages support"
     exit 1
 fi
@@ -6881,14 +6881,47 @@ install_suse_check_services() {
 #    Gentoo Install Functions.
 #
 __autounmask() {
-    emerge --autounmask-write --autounmask-only "${@}"; return $?
+    if [ ! -d /etc/portage/package.use/app-admin ]; then
+        mkdir -p "/etc/portage/package.use/app-admin"
+    fi
+    if [ ! -f /etc/portage/package.use/app-admin/salt ]; then
+        touch "/etc/portage/package.use/app-admin/salt"
+    fi
+    if [ ! -d /etc/portage/package.accept_keywords/app-admin ]; then
+        mkdir -p "/etc/portage/package.accept_keywords/app-admin"
+    fi
+    if [ ! -f /etc/portage/package.accept_keywords/app-admin/salt ]; then
+        touch "/etc/portage/package.accept_keywords/app-admin/salt"
+    fi
+    __emerge --autounmask --autounmask-continue=y --autounmask-use=y --autounmask-write=y --autounmask-only=y "${@}"; return $?
 }
 
 __emerge() {
-    if [ "$_GENTOO_USE_BINHOST" -eq $BS_TRUE ]; then
-        emerge --getbinpkg "${@}"; return $?
+    emerge_debugopts=""
+    if [ "$_ECHO_DEBUG" -eq $BS_TRUE ]; then
+        emerge_debugopts="-v"
+    else
+        emerge_debugopts="--quiet --nospinner -j$(nproc)"
     fi
-    emerge "${@}"; return $?
+    if [ "$_GENTOO_USE_BINHOST" -eq $BS_TRUE ]; then
+        emerge --getbinpkg ${emerge_debugopts} "${@}"; return $?
+    fi
+    emerge -j"$(nproc)" $emerge_debugopts "${@}"; return $?
+}
+
+__emerge_add_useflag() {
+    # Aside from unmasking versions, let portage traverse dependencies for
+    # features on salt itself
+    if [ -d "/etc/portage/package.use/app-admin/" ]; then
+        mkdir -p "/etc/portage/package.use/app-admin/"
+    fi
+    echo "app-admin/salt ${1}" >> "/etc/portage/package.use/app-admin/salt"
+}
+
+__gentoo_enable_testing() {
+    __emerge eselect-repository
+    eselect repository add salt-testing git https://github.com/mgomersbach/salt-testing-overlay.git
+    emaint sync -r salt-testing
 }
 
 __gentoo_config_protection() {
@@ -6897,10 +6930,10 @@ __gentoo_config_protection() {
     # this point, manually merge the changes using etc-update/dispatch-conf/
     # cfg-update and then restart the bootstrapping script, so instead we allow
     # at this point to modify certain config files directly
-    export CONFIG_PROTECT_MASK="${CONFIG_PROTECT_MASK:-} /etc/portage/package.accept_keywords /etc/portage/package.keywords /etc/portage/package.license /etc/portage/package.unmask /etc/portage/package.use"
+    export CONFIG_PROTECT_MASK="${CONFIG_PROTECT_MASK:-} /etc/portage/package.accept_keywords /etc/portage/package.license /etc/portage/package.unmask /etc/portage/package.use"
 
     # emerge currently won't write to files that aren't there, so we need to ensure their presence
-    touch /etc/portage/package.accept_keywords /etc/portage/package.keywords /etc/portage/package.license /etc/portage/package.unmask /etc/portage/package.use
+    mkdir -p /etc/portage/package.accept_keywords /etc/portage/package.license /etc/portage/package.unmask /etc/portage/package.use
 }
 
 __gentoo_pre_dep() {
@@ -6908,43 +6941,40 @@ __gentoo_pre_dep() {
         if __check_command_exists eix; then
             eix-sync
         else
-            emerge --sync
+            __emerge --sync
         fi
     else
         if __check_command_exists eix; then
             eix-sync -q
         else
-            emerge --sync --quiet
+            __emerge --sync
         fi
     fi
     if [ ! -d /etc/portage ]; then
         mkdir /etc/portage
     fi
+
+    # Set features
+    if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
+        __emerge_add_useflag 'libcloud'
+    fi
+
+    # Autounmask available, as no version of salt is stable in portage
+    __autounmask 'app-admin/salt'
 }
 
 __gentoo_post_dep() {
-    # ensures dev-lib/crypto++ compiles happily
-    __emerge --oneshot 'sys-devel/libtool'
     # the -o option asks it to emerge the deps but not the package.
     __gentoo_config_protection
 
-    if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
-        __autounmask 'dev-python/libcloud'
-        __emerge -v 'dev-python/libcloud'
-    fi
-
-    __autounmask 'dev-python/requests'
-    __autounmask 'app-admin/salt'
-
-    __emerge -vo 'dev-python/requests'
-    __emerge -vo 'app-admin/salt'
+    __emerge -o 'app-admin/salt'
 
     if [ "${_EXTRA_PACKAGES}" != "" ]; then
         echoinfo "Installing the following extra packages as requested: ${_EXTRA_PACKAGES}"
         # shellcheck disable=SC2086
         __autounmask ${_EXTRA_PACKAGES} || return 1
         # shellcheck disable=SC2086
-        __emerge -v ${_EXTRA_PACKAGES} || return 1
+        __emerge ${_EXTRA_PACKAGES} || return 1
     fi
 }
 
@@ -6960,12 +6990,14 @@ install_gentoo_git_deps() {
 
 install_gentoo_stable() {
     __gentoo_config_protection
-    __emerge -v 'app-admin/salt' || return 1
+    __emerge 'app-admin/salt' || return 1
 }
 
 install_gentoo_git() {
     __gentoo_config_protection
-    __emerge -v '=app-admin/salt-9999' || return 1
+    __gentoo_enable_testing
+    __autounmask '=app-admin/salt-9999' || return 1
+    __emerge '=app-admin/salt-9999' || return 1
 }
 
 install_gentoo_post() {
